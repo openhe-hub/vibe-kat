@@ -23,3 +23,12 @@ Thumbs.db
 
 # Logs
 *.log
+
+# DINO feature cache
+dino_cache/
+
+# Claude Code internal
+.claude/
+
+# HuggingFace cache
+.cache/

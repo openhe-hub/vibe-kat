@@ -11,7 +11,8 @@ import argparse
 import numpy as np
 import imageio
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add parent dir (kat_baseline/) to path for local imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from kat_eval import (
     extract_waypoints, build_scene_str, build_prompt, fmt,
     call_llm_cached, parse_response, waypoint_to_action,
@@ -166,7 +167,7 @@ def main():
     args = parser.parse_args()
 
     output_dir = args.output or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "results", "videos")
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "results", "videos")
     record_episode(args.task, args.n_demos, args.seed,
                    resolution=args.resolution, output_dir=output_dir)
 

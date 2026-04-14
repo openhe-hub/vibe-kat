@@ -85,25 +85,51 @@ Best average at **n=10** (60.0% all tasks, 75.0% excluding stack_blocks).
 
 ### Cost
 
-- ~$10 total for 625 API calls
+- ~$10 total for 625 API calls (baseline sweep)
 - LLM response caching via SHA256 hash prevents duplicate charges on reruns
+
+## 视觉管线实验
+
+详见 [docs/experiment.md](experiment.md)。
+
+四种方法对比（n_demos=5）：
+
+| 任务 | Baseline (GT) | DINO-ViT | Depth 原始 | **Depth 改进** |
+|------|:---:|:---:|:---:|:---:|
+| reach_target | 100% | 0% | 20% | **64%** |
+| push_button | 84% | — | — | **72%** |
+| pick_up_cup | 56% | — | — | **36%** |
+| take_lid_off_saucepan | 28% | — | — | 0% |
+| stack_blocks | 0% | — | — | 0% |
+
+Depth 改进版核心技术：红色 hue 过滤 + 跨相机簇匹配 + 机械臂遮罩 + 偏移校正。
 
 ## File Structure
 
 ```
 kat_baseline/
-  kat_smoke.py          # Stage 1: single-trial smoke test
-  kat_eval.py           # Stage 2: multi-trial evaluation
-  run_sweep.py          # Stage 3: full task × n_demos sweep
-  plot_results.py       # Stage 4: success rate plot with Wilson CIs
-  record_episode.py     # 3D trajectory visualization (matplotlib)
-  cache/                # LLM response cache (SHA256 → JSON)
+  kat_eval.py               # 基线评估 (GT state)
+  kat_eval_depth.py          # 深度管线评估
+  kat_eval_vision.py         # DINO 管线评估 (已放弃)
+  depth_object_detector.py   # 检测核心
+  camera_utils.py            # 深度投影工具
+  dino_keypoints.py          # DINO 特征提取
+  action_tokens.py           # SE(3) triplet 表示
+  run_sweep.py               # 基线全面扫描
+  run_sweep_depth.py         # 深度管线全面扫描
+  scripts/
+    kat_smoke.py             # 单次冒烟测试
+    plot_results.py          # 成功率绘图
+    record_episode.py        # 录制视频
+    save_visualizations.py   # 生成可视化
+  diagnostics/
+    diagnose_depth.py        # 深度检测诊断
+    diagnose_vision.py       # DINO 诊断
+    diagnose_overhead.py     # overhead 相机分析
+  cache/                     # LLM 响应缓存
   results/
-    sweep.csv           # Full results (625 rows)
-    sweep_smoke.csv     # 1-trial smoke pass (25 rows)
-    results.png         # Success rate plot
-    results.pdf
-    videos/             # Per-episode trajectory visualizations (PNG + GIF)
+    sweep.csv                # 基线完整结果 (625 rows)
+    depth_*.csv              # 深度管线结果
 ```
 
 ## How to Run
@@ -138,9 +164,83 @@ python kat_baseline/plot_results.py
 xvfb-run -a python kat_baseline/record_episode.py --task reach_target --n_demos 5 --seed 1000
 ```
 
+## 视觉管线 (Vision Pipeline)
+
+### 三种场景表征方案
+
+| 方案 | 场景输入 | reach_target n=5 | 说明 |
+|------|---------|-----------------|------|
+| **基线（特权数据）** | `task_low_dim_state` | 100% | 模拟器内部数据，现实不可用 |
+| **DINO-ViT（论文方法）** | DINO keypoints 3D | 0% | BBNN 选择静态特征，无法定位小物体 |
+| **深度方案 v2** | RGB-D 深度差分 | 20% → 改进中 | 可行但需提高检测可靠性 |
+
+### DINO-ViT 方案（已放弃）
+
+按论文复现：DINO-ViT/8, stride=4, layer 9 KEY features, wrist camera, Best Buddies NN。
+- 结果：0/5（0%）— 所有 keypoints 落在桌面 (z≈0.75)
+- 根因：BBNN 选择跨 demo **一致**的特征（桌面、机械臂），而非 **变化**的任务物体
+- 论文在真实机器人上成功是因为物体更大、纹理更丰富
+
+### 深度方案架构
+
+```
+Demo pool (N+5 episodes)
+  ├─ 每个 demo 第一帧的 depth map → 中位数 → 背景模型 (left_shoulder + overhead)
+  ├─ Demo GT positions → 校准检测阈值
+  └─ 每个 demo 第一帧 → 深度差分检测 → demo 场景描述
+
+新场景 observation
+  ├─ left_shoulder depth: |当前 - 背景| > 阈值 → 前景
+  ├─ overhead depth: 同上（独立检测）
+  ├─ 机械臂遮罩: gripper_pose → 线段模型 → 排除臂部像素
+  ├─ 颜色过滤: HSV 饱和度 > 阈值 → 排除灰色像素
+  ├─ 像素聚类 + 智能评分 → 目标物体 3D 位置
+  └─ 多相机交叉验证 → 最终位置估计
+        ↓
+  build_scene_str() → GPT-4o → 执行 (与基线相同)
+```
+
+### 深度管线评测结果
+
+| 任务 | 深度管线 | 基线 (GT) | 深度/基线 |
+|------|---------|----------|-----------|
+| reach_target n=5 | **64%** (16/25) | 100% | 64% |
+| push_button n=5 | **72%** (18/25) | 84% | 86% |
+| pick_up_cup n=5 | 待测 | 56% | ? |
+
+### 关键技术要点
+
+1. **深度格式**: RLBench depth 是 Z-buffer (0-1)，非米。转换: `linear = near + buf * (far - near)`
+2. **投影方法**: 必须用 PyRep 官方 `pointcloud_from_depth` 方法（负焦距 OpenGL 惯例）
+3. **机械臂遮罩**: 用 `obs.gripper_pose` 构建"底座→夹爪"线段，遮罩 0.15m 半径内的像素（含 demo 臂位置）
+4. **多相机融合**: left_shoulder + overhead 各自检测所有候选簇，跨相机匹配找 3D 一致的簇对
+5. **红色色调过滤**: H<25 或 H>230 + 高饱和度，RLBench 任务物体都是红色
+6. **自适应阈值**: 从 demo GT 位置校准（用 pointcloud 反查避免负焦距投影 bug）
+7. **20 demo pool**: 比 10 更稳健的背景模型
+
+### 相关文件
+
+```
+kat_baseline/
+  kat_eval_depth.py         # 深度管线评估入口
+  depth_object_detector.py  # 检测核心：背景模型、机械臂遮罩、多相机融合、簇评分
+  camera_utils.py           # 深度投影工具（PyRep 方法）
+  run_sweep_depth.py        # 深度管线全面扫描
+  kat_eval_vision.py        # DINO 管线评估（已放弃）
+  dino_keypoints.py         # DINO 特征提取
+  action_tokens.py          # SE(3) triplet 表示
+  diagnostics/
+    diagnose_depth.py       # 深度检测诊断
+    diagnose_vision.py      # DINO keypoint 诊断
+    diagnose_overhead.py    # overhead 相机分析
+  scripts/
+    save_visualizations.py  # 生成 RGB/depth/DINO 可视化
+```
+
 ## Known Limitations
 
-- **No GPU rendering** — CoppeliaSim camera requires OpenGL context. Trajectory visualizations use matplotlib instead of simulation screenshots
+- **No GPU rendering** — CoppeliaSim camera requires OpenGL context, but episode recording works via `record_episode.py`
 - **stack_blocks n_demos≥10** — demo collection takes >5 min, may timeout
 - **Open-loop execution** — no replanning. Single LLM call per episode
 - **World frame only** — no relative-to-keypoint transformation (planned ablation)
+- **深度检测局限** — 对极小物体（<1cm）检测不稳定；依赖物体与背景的深度差异
